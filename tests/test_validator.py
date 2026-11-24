@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 import sys
 import unittest
@@ -110,6 +111,36 @@ class TestIsValidIPv6(unittest.TestCase):
             with self.subTest(zone=zone):
                 self.assertFalse(is_valid_ipv6(f"fe80::1%{zone}"))
 
+    def test_zone_ids_with_control_characters_are_rejected(self):
+        # Regression: ``ipaddress`` accepts these, so they used to be valid.
+        for zone in (
+            "eth0\x00",
+            "eth\n0",
+            "lan\tsegment",
+            "eth\r0",
+            "\x1b[31m",
+            "eth0\x7f",
+            "eth\x850",
+            "eth0\u200b",  # zero-width space
+            "eth0\u202e",  # right-to-left override
+        ):
+            with self.subTest(zone=zone):
+                for address in (f"fe80::1%{zone}", f"::ffff:192.168.1.1%{zone}"):
+                    self.assertFalse(is_valid_ipv6(address))
+                    self.assertFalse(is_valid_ip(address))
+                    result = validate_ip(address)
+                    self.assertFalse(result.is_valid)
+                    self.assertIsNone(result.version)
+                    self.assertEqual(
+                        result.reason,
+                        "IPv6 zone ID must not contain control or non-printable characters",
+                    )
+
+    def test_zone_ids_with_printable_unicode_are_accepted(self):
+        for zone in ("lan segment", "réseau", "eth0-é"):
+            with self.subTest(zone=zone):
+                self.assertTrue(is_valid_ipv6(f"fe80::1%{zone}"))
+
 
 class TestValidateIP(unittest.TestCase):
     def test_detects_ipv4(self):
@@ -209,6 +240,67 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, "VALID    IPv4  10.0.0.1\nVALID    IPv6  fe80::1\n")
 
+    def test_stdin_strips_only_one_lf_or_crlf_separator(self):
+        # Regression: rstrip("\r\n") also removed extra carriage returns,
+        # so "::1\r\r\n" or a final "::1\r" were reported as valid.
+        for stdin, expected_code, expected in (
+            ("::1\n", 0, "VALID    IPv6  ::1\n"),
+            ("::1\r\n", 0, "VALID    IPv6  ::1\n"),
+            ("::1", 0, "VALID    IPv6  ::1\n"),
+            ("::1\r\r\n", 1, "INVALID        ::1\\r  ("),
+            ("::1\r", 1, "INVALID        ::1\\r  ("),
+            ("::1\n\r\n", 1, "VALID    IPv6  ::1\nINVALID          ("),
+            ("fe80::1%eth0\x1b\r\n", 1, "INVALID        fe80::1%eth0\\x1b  (IPv6 zone ID"),
+            ("fe80::1%eth0\x00\n", 1, "INVALID        fe80::1%eth0\\x00  (IPv6 zone ID"),
+        ):
+            with self.subTest(stdin=stdin):
+                code, output = self.run_cli([], stdin=stdin)
+                self.assertEqual(code, expected_code)
+                self.assertTrue(output.startswith(expected), output)
+
+    def test_windows_style_stdin_keeps_carriage_returns(self):
+        # Regression: on Windows sys.stdin uses universal newlines
+        # (newline=None), which turned "::1\r\r\n" into "::1\n" + "\n" and
+        # split "a\rb" into two lines. This simulates that stream on any OS.
+        raw = b"::1\r\n::1\r\r\n10.0.0.1\r::1\nfe80::1%eth0\x1b\r\n::1\r"
+        stdin = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8", newline=None)
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch("sys.stdin", stdin):
+            self.assertEqual(main([]), 1)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 5, lines)
+        self.assertEqual(lines[0], "VALID    IPv6  ::1")
+        self.assertTrue(lines[1].startswith("INVALID        ::1\\r  ("), lines[1])
+        self.assertTrue(lines[2].startswith("INVALID        10.0.0.1\\r::1  ("), lines[2])
+        self.assertTrue(lines[3].startswith("INVALID        fe80::1%eth0\\x1b  ("), lines[3])
+        self.assertTrue(lines[4].startswith("INVALID        ::1\\r  ("), lines[4])
+
+    def test_stdin_that_cannot_be_reconfigured_is_still_read(self):
+        stdin = mock.MagicMock()
+        stdin.reconfigure.side_effect = ValueError("already read")
+        stdin.__iter__.return_value = iter(["::1\r\n", "bad\n"])
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch("sys.stdin", stdin):
+            self.assertEqual(main([]), 1)
+        stdin.reconfigure.assert_called_once_with(newline="\n")
+        self.assertTrue(out.getvalue().startswith("VALID    IPv6  ::1\nINVALID        bad"))
+
+    def test_module_stdin_keeps_extra_carriage_returns(self):
+        # Real sys.stdin is reconfigured to split lines on "\n" only, on
+        # every platform, so "\r" reaches the separator handling unchanged.
+        result = subprocess.run(
+            [sys.executable, "-m", "ip_validator"],
+            input=b"::1\r\n::1\r\r\nfe80::1%eth0\x1b\r\n",
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, b"")
+        lines = result.stdout.decode().splitlines()
+        self.assertEqual(lines[0], "VALID    IPv6  ::1")
+        self.assertTrue(lines[1].startswith("INVALID        ::1\\r  ("), lines[1])
+        self.assertTrue(lines[2].startswith("INVALID        fe80::1%eth0\\x1b  ("), lines[2])
+
     def test_stdin_results_are_flushed_before_reading_the_next_line(self):
         out = mock.Mock(wraps=io.StringIO())
 
@@ -227,8 +319,84 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(len(output.splitlines()), 2)
         self.assertNotIn("\t", output)
-        self.assertIn(r"VALID    IPv6  fe80::1%lan\tsegment", output)
+        self.assertIn(r"INVALID        fe80::1%lan\tsegment  (IPv6 zone ID", output)
         self.assertIn(r"INVALID        bad\ninput", output)
+
+    def test_broken_pipe_while_writing_is_handled(self):
+        # Regression: a closed pipe used to propagate BrokenPipeError.
+        for argv, stdin in ((["::1", "1.2.3.4"], None), ([], "::1\n1.2.3.4\n")):
+            with self.subTest(argv=argv):
+                out = mock.Mock(wraps=io.StringIO())
+                out.write.side_effect = BrokenPipeError
+                with redirect_stdout(out), mock.patch("sys.stdin", io.StringIO(stdin or "")):
+                    self.assertEqual(main(argv), 141)
+                out.write.assert_called_once()
+
+    def test_broken_pipe_on_final_flush_is_handled(self):
+        out = mock.Mock(wraps=io.StringIO())
+        out.flush.side_effect = BrokenPipeError
+        with redirect_stdout(out):
+            self.assertEqual(main(["::1"]), 141)
+
+    def test_module_handles_closed_stdout_pipe(self):
+        # Regression: the process used to print a traceback and
+        # "Exception ignored ... BrokenPipeError" on stderr.
+        for args, stdin in ((["::1", "bad"], ""), ([], "::1\nbad\n")):
+            with self.subTest(args=args):
+                read_fd, write_fd = os.pipe()
+                os.close(read_fd)
+                try:
+                    result = subprocess.run(
+                        [sys.executable, "-m", "ip_validator", *args],
+                        input=stdin,
+                        stdout=write_fd,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=5,
+                    )
+                finally:
+                    os.close(write_fd)
+                self.assertEqual(result.returncode, 141)
+                self.assertEqual(result.stderr, "")
+
+    def test_broken_pipe_while_printing_help_is_handled(self):
+        # Regression: BrokenPipeError raised by argparse while printing
+        # --help escaped main() (on write or on the shutdown flush).
+        for side in ("write", "flush"):
+            for flag in ("-h", "--help"):
+                with self.subTest(side=side, flag=flag):
+                    out = mock.Mock(wraps=io.StringIO())
+                    getattr(out, side).side_effect = BrokenPipeError
+                    with redirect_stdout(out):
+                        self.assertEqual(main([flag]), 141)
+
+    def test_help_still_exits_zero(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+            main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("usage: ip_validator", out.getvalue())
+
+    def test_module_help_handles_closed_stdout_pipe(self):
+        # Regression: --help into a closed pipe printed "Exception ignored ...
+        # BrokenPipeError" on stderr and exited with status 120.
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                read_fd, write_fd = os.pipe()
+                os.close(read_fd)
+                try:
+                    result = subprocess.run(
+                        [sys.executable, "-m", "ip_validator", flag],
+                        stdin=subprocess.DEVNULL,
+                        stdout=write_fd,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=5,
+                    )
+                finally:
+                    os.close(write_fd)
+                self.assertEqual(result.returncode, 141)
+                self.assertEqual(result.stderr, "")
 
     def test_control_characters_are_escaped_in_error_messages(self):
         result = ValidationResult("bad", False, reason="invalid\rtext")
