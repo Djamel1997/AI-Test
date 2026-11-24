@@ -13,8 +13,48 @@ EXIT_SOME_INVALID = 1
 EXIT_BROKEN_PIPE = 141
 
 
+class _BrokenPipeRecorder:
+    """Proxy for an output stream that remembers a ``BrokenPipeError``."""
+
+    def __init__(self, stream: object) -> None:
+        self._stream = stream
+        self.error: Optional[BrokenPipeError] = None
+
+    def write(self, text: str) -> object:
+        try:
+            return self._stream.write(text)  # type: ignore[attr-defined]
+        except BrokenPipeError as exc:
+            self.error = exc
+            raise
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """Parser that lets ``BrokenPipeError`` from help/usage output propagate.
+
+    Since Python 3.11, ``ArgumentParser._print_message`` silently ignores
+    ``OSError`` (including ``BrokenPipeError``) raised while writing, so
+    ``--help`` into a closed pipe ended with ``SystemExit(0)`` instead of
+    reaching the broken-pipe handler in ``main``. Only ``BrokenPipeError``
+    raised while writing to ``sys.stdout`` (help output) is re-raised.
+    Messages for other streams, such as usage errors on ``sys.stderr``, and
+    every other error keep the standard library behaviour.
+    """
+
+    def _print_message(self, message: str, file: Optional[object] = None) -> None:
+        if file is None or file is not sys.stdout:
+            super()._print_message(message, file)  # type: ignore[arg-type]
+            return
+        recorder = _BrokenPipeRecorder(file)
+        super()._print_message(message, recorder)  # type: ignore[arg-type]
+        if recorder.error is not None:
+            raise recorder.error
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog="ip_validator",
         description="Validate IPv4 and IPv6 addresses.",
     )

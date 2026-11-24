@@ -1,9 +1,11 @@
+import argparse
+import errno
 import io
 import os
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from ip_validator import (
@@ -14,6 +16,21 @@ from ip_validator import (
     validate_ip,
 )
 from ip_validator.__main__ import main
+
+
+def argparse_ignores_write_errors():
+    """Return True if this Python's argparse ignores OSError on write.
+
+    Probes the standard ``argparse.ArgumentParser`` (not the CLI parser) so
+    tests can state the expected behaviour without hard-coding versions.
+    """
+    stream = mock.Mock()
+    stream.write.side_effect = OSError(errno.EIO, os.strerror(errno.EIO))
+    try:
+        argparse.ArgumentParser(prog="probe")._print_message("x", stream)
+    except OSError:
+        return False
+    return True
 
 VALID_IPV4 = [
     "0.0.0.0",
@@ -287,19 +304,92 @@ class TestCLI(unittest.TestCase):
 
     def test_module_stdin_keeps_extra_carriage_returns(self):
         # Real sys.stdin is reconfigured to split lines on "\n" only, on
-        # every platform, so "\r" reaches the separator handling unchanged.
-        result = subprocess.run(
-            [sys.executable, "-m", "ip_validator"],
-            input=b"::1\r\n::1\r\r\nfe80::1%eth0\x1b\r\n",
-            capture_output=True,
-            timeout=5,
+        # every platform (on Windows it would otherwise translate "\r" and
+        # "\r\n" to "\n"), so "\r" reaches the separator handling unchanged.
+        # Raw bytes are written straight to the child's stdin pipe.
+        whitespace = "  (address contains leading or trailing whitespace)"
+        zone_control = "  (IPv6 zone ID must not contain control or non-printable characters)"
+        cases = (
+            (
+                "CRLF separators only",
+                b"::1\r\n10.0.0.1\r\nfe80::1%eth0\r\n",
+                0,
+                [
+                    "VALID    IPv6  ::1",
+                    "VALID    IPv4  10.0.0.1",
+                    "VALID    IPv6  fe80::1%eth0",
+                ],
+            ),
+            (
+                "mixed LF and CRLF separators",
+                b"::1\n10.0.0.1\r\n::1",
+                0,
+                [
+                    "VALID    IPv6  ::1",
+                    "VALID    IPv4  10.0.0.1",
+                    "VALID    IPv6  ::1",
+                ],
+            ),
+            (
+                "extra carriage returns before LF",
+                b"::1\r\r\n::1\r\r\r\n\r\r\n\r\n10.0.0.1\r\n",
+                1,
+                [
+                    "INVALID        ::1\\r" + whitespace,
+                    "INVALID        ::1\\r\\r" + whitespace,
+                    "INVALID        \\r" + whitespace,
+                    "INVALID          (address is empty)",
+                    "VALID    IPv4  10.0.0.1",
+                ],
+            ),
+            (
+                "carriage returns inside a line",
+                b"10.0.0.1\r::1\n::1\r10.0.0.1\r\nfe80::1%eth0\x1b\r\n",
+                1,
+                [
+                    # The reason comes from ipaddress and may vary by version.
+                    "INVALID        10.0.0.1\\r::1  (",
+                    "INVALID        ::1\\r10.0.0.1  (",
+                    "INVALID        fe80::1%eth0\\x1b" + zone_control,
+                ],
+            ),
+            (
+                "lone carriage return at end of stream",
+                b"::1\r\n::1\r",
+                1,
+                ["VALID    IPv6  ::1", "INVALID        ::1\\r" + whitespace],
+            ),
+            (
+                "stream made of a single carriage return",
+                b"\r",
+                1,
+                ["INVALID        \\r" + whitespace],
+            ),
         )
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stderr, b"")
-        lines = result.stdout.decode().splitlines()
-        self.assertEqual(lines[0], "VALID    IPv6  ::1")
-        self.assertTrue(lines[1].startswith("INVALID        ::1\\r  ("), lines[1])
-        self.assertTrue(lines[2].startswith("INVALID        fe80::1%eth0\\x1b  ("), lines[2])
+        for name, raw, expected_code, expected_lines in cases:
+            with self.subTest(name):
+                result = subprocess.run(
+                    [sys.executable, "-m", "ip_validator"],
+                    input=raw,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, expected_code, result.stdout)
+                self.assertEqual(result.stderr, b"")
+                # Output is pure ASCII (non-printable characters are escaped).
+                # Windows writes "\r\n" for each "\n" printed to stdout.
+                stdout = result.stdout.decode("ascii").replace("\r\n", "\n")
+                self.assertNotIn("\r", stdout)
+                self.assertTrue(stdout.endswith("\n"), stdout)
+                lines = stdout[:-1].split("\n")
+                self.assertEqual(len(lines), len(expected_lines), lines)
+                for line, expected in zip(lines, expected_lines):
+                    if expected.endswith("("):
+                        self.assertTrue(line.startswith(expected), line)
+                        self.assertTrue(line.endswith(")"), line)
+                    else:
+                        self.assertEqual(line, expected)
 
     def test_stdin_results_are_flushed_before_reading_the_next_line(self):
         out = mock.Mock(wraps=io.StringIO())
@@ -370,33 +460,191 @@ class TestCLI(unittest.TestCase):
                     with redirect_stdout(out):
                         self.assertEqual(main([flag]), 141)
 
-    def test_help_still_exits_zero(self):
-        out = io.StringIO()
-        with redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
-            main(["--help"])
-        self.assertEqual(ctx.exception.code, 0)
-        self.assertIn("usage: ip_validator", out.getvalue())
-
-    def test_module_help_handles_closed_stdout_pipe(self):
-        # Regression: --help into a closed pipe printed "Exception ignored ...
-        # BrokenPipeError" on stderr and exited with status 120.
+    def test_broken_pipe_during_help_write_reaches_handler_in_one_write(self):
+        # Regression: since Python 3.11, argparse's _print_message swallows
+        # OSError (BrokenPipeError included) raised by write(), so --help
+        # ended with SystemExit(0) instead of exit status 141.
         for flag in ("-h", "--help"):
             with self.subTest(flag=flag):
-                read_fd, write_fd = os.pipe()
-                os.close(read_fd)
-                try:
+                out = mock.Mock(wraps=io.StringIO())
+                out.write.side_effect = BrokenPipeError
+                with redirect_stdout(out):
+                    self.assertEqual(main([flag]), 141)
+                out.write.assert_called_once()
+
+    def test_argparse_write_error_handling_matches_python_version(self):
+        # Pins the standard library behaviour the CLI relies on: argparse
+        # lets write errors propagate on 3.9 and ignores them on 3.11+.
+        # (3.10 is not in the supported test matrix and is not asserted.)
+        if sys.version_info < (3, 10):
+            self.assertFalse(argparse_ignores_write_errors())
+        elif sys.version_info >= (3, 11):
+            self.assertTrue(argparse_ignores_write_errors())
+
+    def test_other_os_errors_during_help_are_not_reported_as_broken_pipe(self):
+        # Only BrokenPipeError is re-raised. Any other OSError keeps the
+        # standard library behaviour: it propagates (Python 3.9) or is
+        # ignored by argparse, which then exits with status 0 (3.11+).
+        expected_for = (
+            (lambda code: ("exit", 0))
+            if argparse_ignores_write_errors()
+            else (lambda code: ("oserror", code))
+        )
+        for code in (errno.EIO, errno.EINVAL):
+            for flag in ("-h", "--help"):
+                with self.subTest(errno=errno.errorcode[code], flag=flag):
+                    out = mock.Mock(wraps=io.StringIO())
+                    out.write.side_effect = OSError(code, os.strerror(code))
+                    with redirect_stdout(out):
+                        try:
+                            outcome = main([flag])
+                        except SystemExit as exc:
+                            outcome = ("exit", exc.code)
+                        except OSError as exc:
+                            outcome = ("oserror", exc.errno)
+                    self.assertEqual(outcome, expected_for(code))
+                    out.write.assert_called_once()
+
+    def test_argument_errors_on_stderr_keep_standard_behaviour(self):
+        # Regression (fifth review): BrokenPipeError on stderr while argparse
+        # reports a usage error must not be turned into exit status 141 by
+        # the stdout-only help handling. Errors on stderr keep the standard
+        # library behaviour: ignored by argparse on 3.11+ (exit 2), or
+        # propagated to main on 3.9 (exit 141, as in commit 8600de8).
+        ignored = argparse_ignores_write_errors()
+        for exc in (BrokenPipeError(), OSError(errno.EIO, os.strerror(errno.EIO))):
+            with self.subTest(error=type(exc).__name__):
+                err = mock.Mock(wraps=io.StringIO())
+                err.write.side_effect = exc
+                out = io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    try:
+                        outcome = ("return", main(["--unknown-option"]))
+                    except SystemExit as raised:
+                        outcome = ("exit", raised.code)
+                    except OSError as raised:
+                        outcome = ("oserror", raised.errno)
+                if ignored:
+                    expected = ("exit", 2)
+                elif isinstance(exc, BrokenPipeError):
+                    expected = ("return", 141)
+                else:
+                    expected = ("oserror", errno.EIO)
+                self.assertEqual(outcome, expected)
+                self.assertEqual(out.getvalue(), "")
+
+    def test_module_argument_errors_with_normal_stderr_exit_two(self):
+        for mode, python_flags in (("buffered", []), ("unbuffered", ["-u"])):
+            for args in (["--unknown-option"], ["-x"], ["-q", "--unknown-option", "::1"]):
+                with self.subTest(mode=mode, args=args):
                     result = subprocess.run(
-                        [sys.executable, "-m", "ip_validator", flag],
+                        [sys.executable, *python_flags, "-m", "ip_validator", *args],
                         stdin=subprocess.DEVNULL,
-                        stdout=write_fd,
-                        stderr=subprocess.PIPE,
+                        capture_output=True,
                         text=True,
                         timeout=5,
                     )
-                finally:
-                    os.close(write_fd)
-                self.assertEqual(result.returncode, 141)
-                self.assertEqual(result.stderr, "")
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, "")
+                    self.assertTrue(result.stderr.startswith("usage: ip_validator"), result.stderr)
+                    self.assertIn("error: unrecognized arguments: ", result.stderr)
+
+    def test_module_argument_errors_with_closed_stderr_pipe(self):
+        # Regression (fifth review): with stdout open and stderr connected to
+        # a closed pipe, "python -u -m ip_validator --unknown-option" must
+        # keep the behaviour of commit 8600de8: exit 2 where argparse ignores
+        # the write error (3.11+), exit 141 where it propagates (3.9).
+        # Buffered mode: the error surfaces when stderr is flushed at
+        # interpreter shutdown, which exits with status 120 on every version.
+        unbuffered_code = 2 if argparse_ignores_write_errors() else 141
+        for mode, python_flags, expected in (
+            ("buffered", [], 120),
+            ("unbuffered", ["-u"], unbuffered_code),
+        ):
+            for args in (["--unknown-option"], ["-x"]):
+                with self.subTest(mode=mode, args=args):
+                    read_fd, write_fd = os.pipe()
+                    os.close(read_fd)
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, *python_flags, "-m", "ip_validator", *args],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=write_fd,
+                            timeout=5,
+                        )
+                    finally:
+                        os.close(write_fd)
+                    self.assertEqual(result.returncode, expected)
+                    self.assertEqual(result.stdout, b"")
+
+    def test_module_help_with_closed_stderr_pipe_still_prints_help(self):
+        # Help goes to stdout: a closed stderr must not affect it.
+        for mode, python_flags in (("buffered", []), ("unbuffered", ["-u"])):
+            for flag in ("-h", "--help"):
+                with self.subTest(mode=mode, flag=flag):
+                    read_fd, write_fd = os.pipe()
+                    os.close(read_fd)
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, *python_flags, "-m", "ip_validator", flag],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=write_fd,
+                            timeout=5,
+                        )
+                    finally:
+                        os.close(write_fd)
+                    self.assertEqual(result.returncode, 0)
+                    self.assertTrue(result.stdout.startswith(b"usage: ip_validator"), result.stdout)
+
+    def test_help_still_exits_zero(self):
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                out = io.StringIO()
+                with redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+                    main([flag])
+                self.assertEqual(ctx.exception.code, 0)
+                self.assertIn("usage: ip_validator", out.getvalue())
+
+    def test_module_help_to_normal_stdout_exits_zero(self):
+        for mode, python_flags in (("buffered", []), ("unbuffered", ["-u"])):
+            for flag in ("-h", "--help"):
+                with self.subTest(mode=mode, flag=flag):
+                    result = subprocess.run(
+                        [sys.executable, *python_flags, "-m", "ip_validator", flag],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0)
+                    self.assertEqual(result.stderr, "")
+                    self.assertTrue(result.stdout.startswith("usage: ip_validator"), result.stdout)
+
+    def test_module_help_handles_closed_stdout_pipe(self):
+        # Regression: --help into a closed pipe printed "Exception ignored ...
+        # BrokenPipeError" on stderr and exited with status 120 (buffered),
+        # or exited with status 0 on Python 3.11+ (unbuffered, -u), where
+        # write() itself raises and argparse swallowed the error.
+        for mode, python_flags in (("buffered", []), ("unbuffered", ["-u"])):
+            for flag in ("-h", "--help"):
+                with self.subTest(mode=mode, flag=flag):
+                    read_fd, write_fd = os.pipe()
+                    os.close(read_fd)
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, *python_flags, "-m", "ip_validator", flag],
+                            stdin=subprocess.DEVNULL,
+                            stdout=write_fd,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=5,
+                        )
+                    finally:
+                        os.close(write_fd)
+                    self.assertEqual(result.returncode, 141)
+                    self.assertEqual(result.stderr, "")
 
     def test_control_characters_are_escaped_in_error_messages(self):
         result = ValidationResult("bad", False, reason="invalid\rtext")
