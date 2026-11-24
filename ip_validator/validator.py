@@ -7,7 +7,9 @@ extra strictness rules on top of it:
   and bytes, which is not what a textual validator should do);
 * leading/trailing whitespace is rejected;
 * IPv4 octets with leading zeros (e.g. ``192.168.01.1``) are rejected both
-  in standalone IPv4 addresses and in dotted IPv6 suffixes.
+  in standalone IPv4 addresses and in dotted IPv6 suffixes;
+* IPv6 zone IDs containing control or other non-printable characters
+  (e.g. ``fe80::1%eth0\n``) are rejected.
 """
 
 import ipaddress
@@ -23,6 +25,7 @@ __all__ = [
 ]
 
 _LEADING_ZERO_ERROR = "IPv4 octets must not have leading zeros"
+_ZONE_ID_CHARACTER_ERROR = "IPv6 zone ID must not contain control or non-printable characters"
 
 
 @dataclass(frozen=True)
@@ -65,7 +68,11 @@ def _ipv4_error(address: str) -> Optional[str]:
 
 def _ipv6_error(address: str) -> Optional[str]:
     # A zone ID can contain dots and is separate from the address suffix.
-    literal = address.partition("%")[0]
+    literal, _, zone_id = address.partition("%")
+    # ``ipaddress`` accepts any character in a zone ID, including control
+    # characters such as NUL, tab or newline. Interior spaces stay allowed.
+    if not zone_id.isprintable():
+        return _ZONE_ID_CHARACTER_ERROR
     _, separator, suffix = literal.rpartition(":")
     if separator and "." in suffix and _has_leading_zero_octet(suffix):
         return _LEADING_ZERO_ERROR
@@ -89,8 +96,9 @@ def is_valid_ipv6(address: object) -> bool:
     """Return ``True`` if ``address`` is a valid IPv6 address.
 
     Compressed forms (``::1``), embedded IPv4 (``::ffff:1.2.3.4``) and scope
-    IDs (``fe80::1%eth0``) are accepted. Zone IDs follow ``ipaddress`` syntax
-    and are interpreted as opaque strings.
+    IDs (``fe80::1%eth0``) are accepted. Zone IDs follow ``ipaddress`` syntax,
+    must not contain control or non-printable characters, and are
+    interpreted as opaque strings.
     """
     return (
         isinstance(address, str)

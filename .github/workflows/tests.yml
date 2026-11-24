@@ -1,0 +1,48 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: the job only needs to read the repository contents.
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same branch or pull request.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # Run every combination even if one fails, to see platform-specific issues.
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04 is pinned (not ubuntu-latest) because setup-python
+        # does not provide Python 3.9 builds for newer Ubuntu images.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - name: Check out repository
+        # Actions pinned to full commit SHAs for supply-chain safety.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show Python version
+        run: python --version
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
