@@ -4,27 +4,21 @@
 v1.0.0 (unreleased fixes on branch `fix/validator-improvements`)
 
 ## Status
-- Initial implementation completed.
-- Independent review completed.
-- Six audit findings addressed.
-- Initial Git commit completed.
-- Both known issues, three Codex review findings and two findings from the
-  second Codex review fixed on `fix/validator-improvements`.
-- These fixes are committed (`8600de8`, "Fix IP validation and CLI edge
-  cases") and pushed to `origin/fix/validator-improvements`.
+- Branch `fix/validator-improvements`, head `daeebe8` ("Fix Windows closed
+  pipe detection"), pushed (`origin/fix/validator-improvements` = `daeebe8`).
 - Pull request #1 (`fix/validator-improvements` -> `main`) is open as a
-  draft and must stay a draft until the CI matrix is green.
-- Third, fourth and fifth Codex review fixes and the GitHub Actions workflow
-  `.github/workflows/tests.yml` are committed in `84d6d29` ("Fix CLI
-  compatibility and add cross-platform CI") and pushed.
-- First CI run (run 45311526668, `pull_request`, head `84d6d29`): 6 of 9
-  jobs passed (Ubuntu and macOS), the 3 Windows jobs failed (closed-pipe
-  tests only, see "First CI Run").
-- Windows closed-pipe fix in `ip_validator/__main__.py`,
-  `tests/test_validator.py` and `HANDOFF.md`, revised after the seventh
-  Codex review (not committed yet). Windows was already tested natively by
-  the first CI run (on `84d6d29`, without this fix); the fix itself has not
-  run on Windows yet and awaits native validation in the next CI run.
+  draft; GitHub reports it mergeable (`CLEAN`); no review comments.
+- Second CI run (run 45314418221, `pull_request`, head `daeebe8`): 9 of 9
+  jobs passed, 56 tests in each job, no skipped test (see "Second CI Run").
+- All Codex review findings are fixed and committed:
+  - initial audit and first two Codex reviews: `8600de8`;
+  - third, fourth and fifth reviews and the workflow: `84d6d29`;
+  - Windows closed-pipe fix and seventh review: `daeebe8`.
+- First CI run (run 45311526668, head `84d6d29`): 6 of 9 jobs passed, the 3
+  Windows jobs failed on closed-pipe tests (see "First CI Run"); fixed in
+  `daeebe8`.
+- Only `HANDOFF.md` is modified in the working tree (this finalisation,
+  not committed yet).
 
 ## Latest Changes (fix/validator-improvements)
 1. IPv6 zone ID control characters
@@ -79,7 +73,7 @@ v1.0.0 (unreleased fixes on branch `fix/validator-improvements`)
 2. HANDOFF accuracy
    - The Tests section records which added tests already pass on `ab73af1`.
 
-## Third Review Fixes (Codex findings, not committed yet)
+## Third Review Fixes (Codex findings, committed in `84d6d29`)
 Only `HANDOFF.md` and `tests/test_validator.py` were changed. The validator
 source code and the workflow file are unchanged.
 1. HANDOFF accuracy: commit/push state, draft PR #1, untracked workflow,
@@ -104,7 +98,7 @@ source code and the workflow file are unchanged.
    `BrokenPipeError` handling is intentionally unchanged until the
    `windows-latest` CI results are available. No test was disabled.
 
-## Fourth Review Fixes (Codex findings, not committed yet)
+## Fourth Review Fixes (Codex findings, committed in `84d6d29`)
 Changed files: `ip_validator/__main__.py`, `tests/test_validator.py`,
 `HANDOFF.md`. `ip_validator/validator.py`, `README.md` and the workflow file
 are unchanged.
@@ -160,7 +154,7 @@ are unchanged.
      the CI matrix. To be decided later: either make `-...` arguments exit 2
      on every version, or document the version-dependent exit code.
 
-## Fifth Review Fixes (Codex findings, not committed yet)
+## Fifth Review Fixes (Codex findings, committed in `84d6d29`)
 Changed files: `ip_validator/__main__.py`, `tests/test_validator.py`,
 `HANDOFF.md`. The workflow file is unchanged.
 1. Regression: `_BrokenPipeRecorder` was applied to every stream, including
@@ -238,6 +232,14 @@ including the six CR sub-tests, passed natively on Windows):
 | `test_module_help_handles_closed_stdout_pipe` `-u` `-h`/`--help` | 1 | 0 | 0 | 141 |
 | `test_module_argument_errors_with_closed_stderr_pipe` `-u` (both) | 1 | pass (2) | pass (2) | 141 / 2 |
 
+Passing in the same run (native observation): the buffered sub-tests of
+`test_module_argument_errors_with_closed_stderr_pipe` (`--unknown-option`,
+`-x`, closed stderr, expected exit 120) passed on the three Windows jobs
+(on 3.9.13 only the two `-u` sub-tests failed; on 3.11.9 and 3.13.17 the
+whole test passed) and on the six Ubuntu and macOS jobs. The buffered
+closed-stderr status 120 was therefore already validated natively on all
+nine environments by the first CI run.
+
 Analysis. The logs contain exit statuses only: the tests asserted the exit
 status before stderr, so the child's traceback was not printed. Deductions
 from the statuses (not a direct observation of the exception):
@@ -256,7 +258,7 @@ from the statuses (not a direct observation of the exception):
   closed-stdout subprocess tests now include the child's stderr in their
   failure message (diagnostics only, assertions unchanged).
 
-## Windows Closed-Pipe Fix (not committed yet)
+## Windows Closed-Pipe Fix (committed in `daeebe8`)
 Changed files: `ip_validator/__main__.py`, `tests/test_validator.py`,
 `HANDOFF.md`. Workflow unchanged (9 jobs).
 1. `_as_broken_pipe(exc, stream)` converts an `OSError` into
@@ -307,7 +309,7 @@ Changed files: `ip_validator/__main__.py`, `tests/test_validator.py`,
    Review Fixes" for the corrected condition (EINVAL on a pipe is no longer
    enough).
 
-## Seventh Review Fixes (Codex findings, not committed yet)
+## Seventh Review Fixes (Codex findings, committed in `daeebe8`)
 Changed files: `ip_validator/__main__.py`, `tests/test_validator.py`,
 `HANDOFF.md`. Workflow unchanged.
 1. Finding: `_as_broken_pipe` treated any `EINVAL` on a pipe as a closed
@@ -341,6 +343,8 @@ Changed files: `ip_validator/__main__.py`, `tests/test_validator.py`,
      the original error is kept and the Windows closed-pipe tests keep
      failing (no masking, but no fix): then the limitation must be
      documented instead of adding a heuristic.
+     Outcome: both hypotheses confirmed natively by the second CI run (see
+     "Second CI Run").
 3. Tests: 56 (52 kept; nothing removed or disabled; the six CR sub-tests
    unchanged). Updated: the `TestWindowsClosedPipe` simulation helper and
    `test_only_windows_einval_on_a_pipe_is_translated` also patch
@@ -366,14 +370,52 @@ Changed files: `ip_validator/__main__.py`, `tests/test_validator.py`,
    and on 3.13.17 (the stderr test cannot fail on 3.11+, where argparse
    ignores the error in both versions). With the fix all 56 pass.
 
+## Second CI Run (run 45314418221, head `daeebe8`)
+Native results on GitHub-hosted runners, checked with `gh pr checks 1` and
+the job logs (`python -m unittest discover -s tests -v`):
+
+| Job | Python | Result |
+|-----|--------|--------|
+| ubuntu-24.04 | 3.9.25 / 3.11.18 / 3.13.18 | OK (56) / OK (56) / OK (56) |
+| macos-latest | 3.9.13 / 3.11.9 / 3.13.17 | OK (56) / OK (56) / OK (56) |
+| windows-latest | 3.9.13 / 3.11.9 / 3.13.17 | OK (56) / OK (56) / OK (56) |
+
+- No test skipped and no expected failure in any job; the only "warning"
+  lines in the logs are `git` hints printed by `actions/checkout`.
+- Windows, observed natively on the three versions (all `ok`):
+  - `test_module_handles_closed_stdout_pipe` and
+    `test_module_help_handles_closed_stdout_pipe` (buffered and `-u`):
+    exit 141 with empty stderr - the failures of the first run are fixed;
+  - `test_module_argument_errors_with_closed_stderr_pipe`: buffered 120
+    (already passing natively in the first run), `-u` 141 on 3.9 (fixed by
+    `daeebe8`) and 2 on 3.11/3.13, as on POSIX;
+  - `test_pipe_reader_closed_detection_on_real_pipes`: the NT pipe-state
+    query returns False with the reader open and True once it is closed,
+    so the query is permitted on an `os.pipe` write handle and reports
+    `FILE_PIPE_CLOSING_STATE`;
+  - the three `test_einval_with_open_reader_*` tests: with a real pipe whose
+    reader is open, an injected EINVAL keeps the original error;
+  - `test_module_stdin_keeps_extra_carriage_returns` (six raw-byte CR
+    sub-tests) and `test_windows_style_stdin_keeps_carriage_returns`.
+- Errno: since only `EINVAL` is translated and the closed-stdout tests now
+  return 141 on Windows (while the first run excluded `BrokenPipeError`),
+  the Windows error was `EINVAL`. This is inferred from the two runs, not
+  printed in a log.
+- Raw CR manual check: no longer needed. The automated
+  `test_module_stdin_keeps_extra_carriage_returns` writes raw bytes (CRLF,
+  extra CRs, CRs inside a line, a lone final CR) to the real stdin pipe of
+  `python -m ip_validator` and checks every output line, the exit status
+  and stderr; it passed natively on all three Windows jobs. Interactive
+  console input (typing in a Windows console, not a pipe) is not covered.
+
 ## Tests
 Legend: *native* = real interpreter and OS behaviour observed; *simulation*
 = Windows behaviour reproduced with patches/injected errors; *hypothesis* =
 not yet observed.
 - Seventh review (native, macOS arm64, 56 tests): CPython 3.9.6 OK,
   3.11.17 OK, 3.13.17 OK. The NT pipe-state query itself has never run
-  (macOS has no `ntdll`); its Windows behaviour is a hypothesis until the
-  next CI run.
+  (macOS has no `ntdll`); its Windows behaviour was later confirmed by the
+  second CI run.
 - Windows closed-pipe fix, first version, native runs on macOS arm64 (52
   tests): CPython 3.9.6 OK, 3.11.17 OK, 3.13.17 OK. Windows: simulation
   only.
@@ -426,8 +468,8 @@ not yet observed.
   `test_stdin_that_cannot_be_reconfigured_is_still_read` also fail with just
   the stdin reconfiguration bypassed in the current implementation.
 - Windows stdin behaviour was simulated on macOS with
-  `io.TextIOWrapper(..., newline=None)`. Native Windows runs of the test
-  suite and a CLI check with raw CR input are still pending.
+  `io.TextIOWrapper(..., newline=None)`. (Native Windows runs and the raw
+  CR check were then covered by the CI runs, see "Second CI Run".)
 - Manual check: `yes ::1 | head -n 100000 | python3 -m ip_validator | head -n 1`
   prints one line, no stderr output, Python process exit status 141
   (read from `pipestatus`; the pipeline itself returns `head`'s status).
@@ -438,9 +480,9 @@ not yet observed.
   reports `::1\r` INVALID, `10.0.0.1` VALID, `10.0.0.1\r::1` INVALID (exit 1).
 
 ## Continuous Integration
-- `.github/workflows/tests.yml` is committed in `84d6d29` and ran once on
-  PR #1 (run 45311526668, see "First CI Run"). It has not been modified
-  since.
+- `.github/workflows/tests.yml` is committed in `84d6d29` and has not been
+  modified since. Runs on PR #1: 45311526668 (`84d6d29`, 6/9) and
+  45314418221 (`daeebe8`, 9/9).
 - It runs `python -m unittest discover -s tests -v` in 9 jobs
   (`fail-fast: false`, 15-minute timeout):
 
@@ -450,9 +492,18 @@ not yet observed.
   | `windows-latest` | job 4 | job 5 | job 6 |
   | `macos-latest` | job 7 | job 8 | job 9 |
 
-- First run: Ubuntu and macOS jobs green (45 tests), Windows jobs failed
-  on closed-pipe tests. The Windows fix is local and not yet validated by
-  CI.
+- First run (45311526668, `84d6d29`, 45 tests): 6/9 - Ubuntu and macOS
+  green, the three Windows jobs failed on closed-pipe tests.
+- Second run (45314418221, `daeebe8`): 9/9, 56 tests passed in each of the
+  nine environments (no skipped test), read from the job logs
+  (`Ran 56 tests` ... `OK`):
+
+  | OS | Python 3.9 | Python 3.11 | Python 3.13 |
+  |----|------------|-------------|-------------|
+  | `ubuntu-24.04` | 3.9.25: 56/56 | 3.11.18: 56/56 | 3.13.18: 56/56 |
+  | `windows-latest` | 3.9.13: 56/56 | 3.11.9: 56/56 | 3.13.17: 56/56 |
+  | `macos-latest` | 3.9.13: 56/56 | 3.11.9: 56/56 | 3.13.17: 56/56 |
+
 - Triggers: `push` to `main` and `pull_request` targeting `main` (PR #1
   triggers it on each push to `fix/validator-improvements`).
 - Permissions: `contents: read` only; checkout with
@@ -460,57 +511,52 @@ not yet observed.
   (`actions/checkout` v7.0.1, `actions/setup-python` v7.1.0).
 - `ubuntu-24.04` is pinned because setup-python has no Python 3.9 build for
   newer Ubuntu images.
-- Test count: 52 locally (45 in the first CI run, 37 at the first local
-  check). `actionlint` was not available locally.
+- Test count: 56, both locally (native macOS, CPython 3.9.6, 3.11.17 and
+  3.13.17: 56/56 each) and in CI (56/56 in each of the nine jobs of the
+  second run); 45 in the first CI run, 37 at the first local check.
+  `actionlint` was not available locally.
 
 ## Next Task
-1. Codex audits the seventh review fixes.
-2. After user approval, commit `ip_validator/__main__.py`, `HANDOFF.md` and
-   `tests/test_validator.py`, and push to `fix/validator-improvements`
-   (PR #1 stays a draft).
-3. Check the second CI run, especially the three `windows-latest` jobs. If a
-   closed-pipe test still fails, its message now shows the child's stderr
-   (exception type and errno) - use it before any further change.
+Prepare the merge of PR #1 into `main` (each step needs user approval):
+1. Final Codex audit of `daeebe8` and of this `HANDOFF.md` update.
+2. Commit this `HANDOFF.md` update and push it to
+   `fix/validator-improvements`; check that the CI run on the new head is
+   9/9 again.
+3. Mark PR #1 as ready for review (`gh pr ready 1`), then merge it into
+   `main` with the method chosen by the user. The `push` trigger then runs
+   the CI on `main`.
 
 ## Known Issues
-- Windows stdin/CR handling: verified natively by the first CI run (the six
-  CR sub-tests and the stdin tests passed on all three Windows jobs).
-- Windows closed pipes: failures observed natively in the first CI run
-  (see "First CI Run"); fix implemented, tested on macOS and by simulation,
-  native Windows validation pending. Hypotheses not yet verified natively:
-  the exact errno (EINVAL is deduced from exit statuses); that the NT
-  pipe-state query works on the stdout write handle and reports
-  `FILE_PIPE_CLOSING_STATE` (see "Seventh Review Fixes"); that redirecting
-  fd 1 to `NUL` in `_discard_stdout` avoids the shutdown status 120 for
-  buffered stdout on Windows.
+Remaining limitations (none blocks the merge):
+- Python 3.14 (outside the supported matrix 3.9/3.11/3.13): argparse's new
+  negative-number pattern makes `-1.2.3.4` without `--` a positional
+  address, reported INVALID with exit 1 instead of an argument error with
+  exit 2 (see Fourth Review Fixes, item 3);
+  `test_module_exit_codes_and_end_of_options` fails on 3.14.9 (native,
+  macOS). Decision pending: make such arguments exit 2 on every version, or
+  document the version-dependent exit code. Out of scope for PR #1.
+- `_ArgumentParser` overrides the private argparse method
+  `_print_message`; a future Python release could change it. The subprocess
+  help/usage tests would detect it.
 - `_pipe_reader_closed` uses `NtQueryInformationFile`, an NT native API
   documented in the Windows Driver Kit (`ntifs.h`) rather than in the Win32
-  API; if a Windows release changed it, the query fails safely (original
-  error kept).
-- Historical note (before the first CI run) - potential Windows broken-pipe
-  risk (identified by Codex):
-  on Windows, writing or flushing to a closed pipe may raise
-  `OSError(errno.EINVAL, "Invalid argument")` instead of `BrokenPipeError`.
-  `main` only catches `BrokenPipeError`, so such an error would escape with a
-  traceback and a status other than 141. Tests likely affected on
-  `windows-latest`: `test_module_handles_closed_stdout_pipe` and
-  `test_module_help_handles_closed_stdout_pipe`. Decision: no change to the
-  handling before the real CI results; no test disabled. If they fail with
-  EINVAL, a follow-up fix (with a regression test) should treat that case as
-  a closed pipe on Windows only. Interaction with the fourth review fix:
-  `_BrokenPipeRecorder` re-raises `BrokenPipeError` only; an `EINVAL`
-  during `--help` output is still ignored by argparse on 3.11+ (exit 0)
-  and would propagate on 3.9. The fifth review tests with a closed pipe
-  (`test_module_argument_errors_with_closed_stderr_pipe`, expected 120 /
-  2 / 141, and `test_module_help_with_closed_stderr_pipe_still_prints_help`)
-  may also behave differently on Windows if EINVAL is raised instead of
-  `BrokenPipeError` (e.g. 3.9 `-u` would not give 141); to be checked
-  against the `windows-latest` results.
-- The buffered closed-stderr exit status 120 is CPython's status for a
-  failed flush at shutdown; verified on macOS only.
-- Python 3.14: `-1.2.3.4` without `--` exits 1 instead of 2 (see Fourth
-  Review Fixes, item 3); `test_module_exit_codes_and_end_of_options` fails
-  on 3.14.9. Not in the CI matrix; decision pending.
-- `_ArgumentParser` overrides the private argparse method
-  `_print_message`; a future Python release could rename it. The
-  subprocess tests would detect such a change.
+  API. Verified natively on the `windows-latest` runner image only; if a
+  Windows release changed it, the query fails safely (original error kept,
+  exit status not 141).
+- Windows closed-pipe detection is verified for pipes created by `os.pipe`
+  / `subprocess` (`CreatePipe`), as in the CI tests. Pipes created by other
+  shells or tools (e.g. PowerShell or `cmd` pipelines into `more`) were not
+  tested; if the query is refused there, the original error is kept.
+- Windows interactive console input (not a pipe) is not covered by the
+  automated CR tests.
+- The 141 exit status is the Python process status; a shell pipeline's
+  status depends on the shell (see README).
+- `actionlint` has not been run on the workflow.
+
+Resolved by the second CI run (kept for traceability): Windows closed-pipe
+failures of the first run; the native behaviour of the NT pipe-state query;
+the shutdown status 120 for buffered stdout on Windows (closed-stdout tests
+now exit 141 with empty stderr); the raw CR check on Windows; the Windows
+3.9 `-u` closed-stderr status 141. The buffered closed-stderr status 120 was
+already validated natively on all nine environments by the first CI run
+(see "First CI Run").
