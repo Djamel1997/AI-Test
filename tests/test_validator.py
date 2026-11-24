@@ -15,6 +15,7 @@ from ip_validator import (
     is_valid_ipv6,
     validate_ip,
 )
+from ip_validator import __main__ as cli
 from ip_validator.__main__ import main
 
 
@@ -446,7 +447,7 @@ class TestCLI(unittest.TestCase):
                     )
                 finally:
                     os.close(write_fd)
-                self.assertEqual(result.returncode, 141)
+                self.assertEqual(result.returncode, 141, result.stderr)
                 self.assertEqual(result.stderr, "")
 
     def test_broken_pipe_while_printing_help_is_handled(self):
@@ -643,7 +644,7 @@ class TestCLI(unittest.TestCase):
                         )
                     finally:
                         os.close(write_fd)
-                    self.assertEqual(result.returncode, 141)
+                    self.assertEqual(result.returncode, 141, result.stderr)
                     self.assertEqual(result.stderr, "")
 
     def test_control_characters_are_escaped_in_error_messages(self):
@@ -674,6 +675,247 @@ class TestCLI(unittest.TestCase):
                 else:
                     self.assertEqual(result.stderr, "")
 
+
+def einval():
+    return OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+
+
+class TestWindowsClosedPipe(unittest.TestCase):
+    """Windows reports a closed pipe as OSError(EINVAL), not BrokenPipeError.
+
+    First CI run (84d6d29, run 45311526668): every closed-pipe subprocess
+    test failed on windows-latest only. Most tests simulate the Windows
+    error on any OS by patching ``_WINDOWS``, ``_is_pipe`` and
+    ``_pipe_reader_closed``; the native check is done by the subprocess
+    tests and the real-pipe tests on windows-latest.
+    """
+
+    def simulate(self, windows=True, pipe=True, reader_closed=True):
+        for name, value in (("_WINDOWS", windows),):
+            patcher = mock.patch.object(cli, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, value in (("_is_pipe", pipe), ("_pipe_reader_closed", reader_closed)):
+            patcher = mock.patch.object(cli, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_main(self, argv, out, err=None, stdin=""):
+        err = err if err is not None else io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), mock.patch(
+            "sys.stdin", io.StringIO(stdin)
+        ):
+            try:
+                return ("return", main(argv))
+            except SystemExit as exc:
+                return ("exit", exc.code)
+            except BrokenPipeError:
+                return ("brokenpipe", None)
+            except OSError as exc:
+                return ("oserror", exc.errno)
+
+    def test_is_pipe_detects_real_pipes_only(self):
+        # Native on every OS.
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb") as writer:
+            self.assertTrue(cli._is_pipe(writer))
+            self.assertTrue(cli._is_pipe(reader))
+        self.assertFalse(cli._is_pipe(io.StringIO()))
+        self.assertFalse(cli._is_pipe(object()))
+        with open(os.devnull, "w") as devnull:
+            self.assertFalse(cli._is_pipe(devnull))
+
+    def test_only_windows_einval_on_a_pipe_is_translated(self):
+        stream = object()
+        for windows, pipe, closed, exc, translated in (
+            (True, True, True, einval(), True),
+            (False, True, True, einval(), False),
+            (True, False, True, einval(), False),
+            # Seventh review: EINVAL on a pipe whose reader is not confirmed
+            # closed keeps the original error.
+            (True, True, False, einval(), False),
+            (True, True, True, OSError(errno.EIO, os.strerror(errno.EIO)), False),
+            (True, True, True, OSError(errno.ENOSPC, os.strerror(errno.ENOSPC)), False),
+        ):
+            with self.subTest(
+                windows=windows, pipe=pipe, reader_closed=closed, errno=errno.errorcode[exc.errno]
+            ):
+                with mock.patch.object(cli, "_WINDOWS", windows), mock.patch.object(
+                    cli, "_is_pipe", return_value=pipe
+                ), mock.patch.object(cli, "_pipe_reader_closed", return_value=closed):
+                    result = cli._as_broken_pipe(exc, stream)
+                if translated:
+                    self.assertIsInstance(result, BrokenPipeError)
+                    self.assertEqual(result.errno, errno.EPIPE)
+                    self.assertIs(result.__cause__, exc)
+                else:
+                    self.assertIs(result, exc)
+        broken = BrokenPipeError(errno.EPIPE, "Broken pipe")
+        with mock.patch.object(cli, "_WINDOWS", True):
+            self.assertIs(cli._as_broken_pipe(broken, stream), broken)
+
+    def test_einval_while_writing_results_returns_141(self):
+        self.simulate()
+        for argv, stdin in ((["::1", "bad"], ""), ([], "::1\nbad\n")):
+            for side in ("write", "flush"):
+                with self.subTest(argv=argv, side=side):
+                    out = mock.Mock(wraps=io.StringIO())
+                    getattr(out, side).side_effect = einval()
+                    err = io.StringIO()
+                    self.assertEqual(self.run_main(argv, out, err, stdin), ("return", 141))
+                    self.assertEqual(err.getvalue(), "")
+
+    def test_einval_while_printing_help_returns_141(self):
+        # Covers unbuffered (write fails) and buffered (flush fails) stdout.
+        self.simulate()
+        for side in ("write", "flush"):
+            for flag in ("-h", "--help"):
+                with self.subTest(side=side, flag=flag):
+                    out = mock.Mock(wraps=io.StringIO())
+                    getattr(out, side).side_effect = einval()
+                    err = io.StringIO()
+                    self.assertEqual(self.run_main([flag], out, err), ("return", 141))
+                    self.assertEqual(err.getvalue(), "")
+
+    def test_einval_on_stderr_matches_posix_broken_pipe_behaviour(self):
+        # Reference (POSIX, commit 8600de8): a BrokenPipeError on stderr
+        # during a usage error is ignored by argparse on 3.11+ (exit 2) and
+        # propagates to main on 3.9 (exit 141). Windows EINVAL must match.
+        self.simulate()
+        expected = ("exit", 2) if argparse_ignores_write_errors() else ("return", 141)
+        for args in (["--unknown-option"], ["-x"]):
+            with self.subTest(args=args):
+                err = mock.Mock(wraps=io.StringIO())
+                err.write.side_effect = einval()
+                out = io.StringIO()
+                self.assertEqual(self.run_main(args, out, err), expected)
+                self.assertEqual(out.getvalue(), "")
+
+    def test_other_errors_are_not_masked_on_windows(self):
+        # EIO on a pipe, or EINVAL on a stream that is not a pipe, keeps the
+        # original exception (or argparse's standard handling for help).
+        ignored = argparse_ignores_write_errors()
+        for pipe, code in ((True, errno.EIO), (False, errno.EINVAL)):
+            exc_name = errno.errorcode[code]
+            with self.subTest(pipe=pipe, errno=exc_name, case="results"):
+                self.simulate(pipe=pipe)
+                out = mock.Mock(wraps=io.StringIO())
+                out.write.side_effect = OSError(code, os.strerror(code))
+                self.assertEqual(self.run_main(["::1"], out), ("oserror", code))
+            with self.subTest(pipe=pipe, errno=exc_name, case="help"):
+                out = mock.Mock(wraps=io.StringIO())
+                out.write.side_effect = OSError(code, os.strerror(code))
+                expected = ("exit", 0) if ignored else ("oserror", code)
+                self.assertEqual(self.run_main(["--help"], out), expected)
+
+    def test_einval_is_not_translated_outside_windows(self):
+        self.simulate(windows=False)
+        out = mock.Mock(wraps=io.StringIO())
+        out.write.side_effect = einval()
+        self.assertEqual(self.run_main(["::1"], out), ("oserror", errno.EINVAL))
+
+
+    def real_pipe_stream(self, side, exc):
+        """Stream backed by a real pipe whose reader stays open.
+
+        ``side`` ("write" or "flush") raises ``exc``; nothing reaches the
+        pipe. Returns the stream; both pipe ends are closed on cleanup.
+        """
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        stream = mock.Mock(wraps=io.StringIO())
+        stream.fileno = lambda: write_fd
+        getattr(stream, side).side_effect = exc
+        self.assertTrue(cli._is_pipe(stream))
+        return stream
+
+    def test_pipe_reader_closed_detection_on_real_pipes(self):
+        # Native on every OS. Windows: the NT pipe state is queried for real
+        # (open reader -> not closed, closed reader -> closing state).
+        # Elsewhere the function always returns False.
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(os.dup(write_fd), "wb") as writer:
+                self.assertFalse(cli._pipe_reader_closed(writer))
+                os.close(read_fd)
+                read_fd = None
+                self.assertEqual(cli._pipe_reader_closed(writer), cli._WINDOWS)
+        finally:
+            os.close(write_fd)
+            if read_fd is not None:
+                os.close(read_fd)
+        self.assertFalse(cli._pipe_reader_closed(io.StringIO()))
+        self.assertFalse(cli._pipe_reader_closed(object()))
+
+    def test_einval_with_open_reader_keeps_original_error_for_results(self):
+        # Seventh review regression: real pipe, reader still open, EINVAL
+        # injected. Not confirmed as a closed pipe, so the original OSError
+        # propagates (not 141). ``_WINDOWS`` is forced so the translation
+        # path runs; on Windows the pipe state is queried natively.
+        with mock.patch.object(cli, "_WINDOWS", True):
+            for argv, stdin in ((["::1", "bad"], ""), ([], "::1\nbad\n")):
+                for side in ("write", "flush"):
+                    with self.subTest(argv=argv, side=side):
+                        injected = einval()
+                        out = self.real_pipe_stream(side, injected)
+                        err = io.StringIO()
+                        with redirect_stdout(out), redirect_stderr(err), mock.patch(
+                            "sys.stdin", io.StringIO(stdin)
+                        ), self.assertRaises(OSError) as ctx:
+                            main(argv)
+                        self.assertIs(ctx.exception, injected)
+                        self.assertNotIsInstance(ctx.exception, BrokenPipeError)
+                        self.assertEqual(err.getvalue(), "")
+
+    def test_einval_with_open_reader_keeps_standard_help_behaviour(self):
+        # Same as above for -h/--help. write(): argparse's standard handling
+        # of the original error (propagates on 3.9, ignored -> exit 0 on
+        # 3.11+). flush() (done by the CLI after argparse): the original
+        # error propagates on every version.
+        ignored = argparse_ignores_write_errors()
+        with mock.patch.object(cli, "_WINDOWS", True):
+            for side in ("write", "flush"):
+                for flag in ("-h", "--help"):
+                    with self.subTest(side=side, flag=flag):
+                        injected = einval()
+                        out = self.real_pipe_stream(side, injected)
+                        with redirect_stdout(out):
+                            try:
+                                outcome = ("return", main([flag]))
+                            except SystemExit as exc:
+                                outcome = ("exit", exc.code)
+                            except OSError as exc:
+                                self.assertIs(exc, injected)
+                                outcome = ("oserror", exc.errno)
+                        if side == "write" and ignored:
+                            expected = ("exit", 0)
+                        else:
+                            expected = ("oserror", errno.EINVAL)
+                        self.assertEqual(outcome, expected)
+
+    def test_einval_with_open_reader_on_stderr_keeps_standard_behaviour(self):
+        # Usage error written to a real pipe (reader open) that fails with
+        # EINVAL: argparse's standard handling of the original error
+        # (propagates on 3.9, ignored -> exit 2 on 3.11+); never 141.
+        ignored = argparse_ignores_write_errors()
+        with mock.patch.object(cli, "_WINDOWS", True):
+            for args in (["--unknown-option"], ["-x"]):
+                with self.subTest(args=args):
+                    injected = einval()
+                    err = self.real_pipe_stream("write", injected)
+                    out = io.StringIO()
+                    with redirect_stdout(out), redirect_stderr(err):
+                        try:
+                            outcome = ("return", main(args))
+                        except SystemExit as exc:
+                            outcome = ("exit", exc.code)
+                        except OSError as exc:
+                            self.assertIs(exc, injected)
+                            outcome = ("oserror", exc.errno)
+                    expected = ("exit", 2) if ignored else ("oserror", errno.EINVAL)
+                    self.assertEqual(outcome, expected)
+                    self.assertEqual(out.getvalue(), "")
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,9 +1,12 @@
 """Command-line interface: ``python -m ip_validator <address> [...]``."""
 
 import argparse
+import errno
 import os
+import stat
 import sys
-from typing import Iterable, List, Optional
+from contextlib import contextmanager
+from typing import Iterator, Iterable, List, Optional
 
 from .validator import validate_ip
 
@@ -12,9 +15,127 @@ EXIT_SOME_INVALID = 1
 # Conventional shell status for a process stopped by SIGPIPE (128 + 13).
 EXIT_BROKEN_PIPE = 141
 
+_WINDOWS = os.name == "nt"
+
+
+def _is_pipe(stream: object) -> bool:
+    """Return True if ``stream`` is backed by a pipe file descriptor."""
+    try:
+        return stat.S_ISFIFO(os.fstat(stream.fileno()).st_mode)  # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+# NtQueryInformationFile(FilePipeLocalInformation) constants (ntifs.h).
+_FILE_PIPE_LOCAL_INFORMATION_CLASS = 24
+_FILE_PIPE_CLOSING_STATE = 4
+
+
+def _pipe_reader_closed(stream: object) -> bool:
+    """Return True only if Windows confirms the other end of the pipe closed.
+
+    Queries the pipe state of ``stream``'s handle with
+    ``NtQueryInformationFile(FilePipeLocalInformation)``: ``NamedPipeState``
+    is ``FILE_PIPE_CLOSING_STATE`` once the other end (the reader of a
+    stdout/stderr pipe) has been closed. This is a read-only query: nothing
+    is written, no data is consumed and it does not wait for the reader.
+    Any failure (not Windows, no ``ctypes``/``msvcrt``, no file descriptor,
+    query refused) returns False, so the closure is never assumed.
+    """
+    if not _WINDOWS:
+        return False
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        handle = msvcrt.get_osfhandle(stream.fileno())  # type: ignore[attr-defined]
+
+        class _IoStatusBlock(ctypes.Structure):
+            _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+        class _FilePipeLocalInformation(ctypes.Structure):
+            _fields_ = [
+                (name, wintypes.ULONG)
+                for name in (
+                    "NamedPipeType",
+                    "NamedPipeConfiguration",
+                    "MaximumInstances",
+                    "CurrentInstances",
+                    "InboundQuota",
+                    "ReadDataAvailable",
+                    "OutboundQuota",
+                    "WriteQuotaAvailable",
+                    "NamedPipeState",
+                    "NamedPipeEnd",
+                )
+            ]
+
+        query = ctypes.WinDLL("ntdll").NtQueryInformationFile  # type: ignore[attr-defined]
+        query.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_IoStatusBlock),
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.c_int,
+        ]
+        query.restype = ctypes.c_long  # NTSTATUS
+        status_block = _IoStatusBlock()
+        info = _FilePipeLocalInformation()
+        status = query(
+            handle,
+            ctypes.byref(status_block),
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            _FILE_PIPE_LOCAL_INFORMATION_CLASS,
+        )
+    except Exception:  # ImportError, OSError, ValueError, AttributeError...
+        return False
+    return status == 0 and info.NamedPipeState == _FILE_PIPE_CLOSING_STATE
+
+
+def _as_broken_pipe(exc: OSError, stream: object) -> OSError:
+    """Map Windows' closed-pipe ``EINVAL`` to ``BrokenPipeError``.
+
+    On Windows, writing to a pipe whose reader has gone away fails with
+    ``OSError(EINVAL)`` instead of ``BrokenPipeError`` (the standard library
+    handles the same case in ``subprocess.Popen._stdin_write``, bpo-19612 and
+    bpo-30418). ``EINVAL`` alone does not prove the reader is gone, so the
+    error is translated only when the closure is confirmed: Windows, errno
+    ``EINVAL``, ``stream`` is a pipe and ``_pipe_reader_closed`` confirms
+    the closing state. Otherwise the original error is returned unchanged.
+    """
+    if (
+        _WINDOWS
+        and not isinstance(exc, BrokenPipeError)
+        and exc.errno == errno.EINVAL
+        and _is_pipe(stream)
+        and _pipe_reader_closed(stream)
+    ):
+        error = BrokenPipeError(errno.EPIPE, exc.strerror)
+        error.__cause__ = exc
+        return error
+    return exc
+
+
+@contextmanager
+def _stdout_pipe_errors() -> Iterator[None]:
+    """Raise ``BrokenPipeError`` for a closed stdout pipe on every platform."""
+    try:
+        yield
+    except OSError as exc:
+        translated = _as_broken_pipe(exc, sys.stdout)
+        if translated is exc:
+            raise
+        raise translated from exc
+
 
 class _BrokenPipeRecorder:
-    """Proxy for an output stream that remembers a ``BrokenPipeError``."""
+    """Proxy for an output stream that remembers a ``BrokenPipeError``.
+
+    A closed-pipe ``EINVAL`` on Windows is raised as ``BrokenPipeError``
+    (see ``_as_broken_pipe``) so every platform reports the same error.
+    """
 
     def __init__(self, stream: object) -> None:
         self._stream = stream
@@ -26,6 +147,12 @@ class _BrokenPipeRecorder:
         except BrokenPipeError as exc:
             self.error = exc
             raise
+        except OSError as exc:
+            translated = _as_broken_pipe(exc, self._stream)
+            if translated is exc:
+                raise
+            self.error = translated  # type: ignore[assignment]
+            raise translated from exc
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._stream, name)
@@ -38,18 +165,23 @@ class _ArgumentParser(argparse.ArgumentParser):
     ``OSError`` (including ``BrokenPipeError``) raised while writing, so
     ``--help`` into a closed pipe ended with ``SystemExit(0)`` instead of
     reaching the broken-pipe handler in ``main``. Only ``BrokenPipeError``
-    raised while writing to ``sys.stdout`` (help output) is re-raised.
-    Messages for other streams, such as usage errors on ``sys.stderr``, and
-    every other error keep the standard library behaviour.
+    raised while writing to ``sys.stdout`` (help output) is re-raised after
+    argparse returns. Messages for other streams, such as usage errors on
+    ``sys.stderr``, keep the standard library behaviour (ignored on 3.11+,
+    propagated on 3.9); on Windows their closed-pipe ``EINVAL`` is first
+    reported as ``BrokenPipeError`` so the result matches POSIX. Every other
+    error is left unchanged.
     """
 
     def _print_message(self, message: str, file: Optional[object] = None) -> None:
-        if file is None or file is not sys.stdout:
-            super()._print_message(message, file)  # type: ignore[arg-type]
+        if file is None:
+            file = sys.stderr
+        if file is None:
+            super()._print_message(message, file)
             return
         recorder = _BrokenPipeRecorder(file)
         super()._print_message(message, recorder)  # type: ignore[arg-type]
-        if recorder.error is not None:
+        if file is sys.stdout and recorder.error is not None:
             raise recorder.error
 
 
@@ -137,7 +269,8 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         # ``--help`` writes to buffered stdout before exiting. Flush here so a
         # closed pipe is reported inside ``main`` rather than during
         # interpreter shutdown.
-        sys.stdout.flush()
+        with _stdout_pipe_errors():
+            sys.stdout.flush()
         raise
 
 
@@ -166,14 +299,17 @@ def _validate_all(cli_addresses: List[str], quiet: bool) -> int:
             continue
         display_address = _escape_non_printable(result.address)
         if result.is_valid:
-            print(f"VALID    IPv{result.version}  {display_address}", flush=reads_stdin)
+            line = f"VALID    IPv{result.version}  {display_address}"
         else:
             reason = _escape_non_printable(result.reason or "")
-            print(f"INVALID        {display_address}  ({reason})", flush=reads_stdin)
+            line = f"INVALID        {display_address}  ({reason})"
+        with _stdout_pipe_errors():
+            print(line, flush=reads_stdin)
 
     # Flush here so a closed pipe is reported inside ``main`` rather than
     # during interpreter shutdown.
-    sys.stdout.flush()
+    with _stdout_pipe_errors():
+        sys.stdout.flush()
     return EXIT_ALL_VALID if all_valid else EXIT_SOME_INVALID
 
 
